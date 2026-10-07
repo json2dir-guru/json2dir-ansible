@@ -1,0 +1,162 @@
+# json2dir: create the directory tree a JSON document describes (RFC J2D-1), as an Ansible playbook.
+# Run through the `json2dir` wrapper, which saves stdin to a file and sets J2D_INPUT and J2D_TARGET.
+- name: json2dir
+  hosts: localhost
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+    j2d_target: "{{ lookup('ansible.builtin.env', 'J2D_TARGET') }}"
+    j2d_max_depth: 1000
+    j2d_existing: {}
+  tasks:
+    # §3: lookup('file') decodes with surrogateescape, so invalid UTF-8 shows up as U+DC80..U+DCFF.
+    - name: Read the document
+      ansible.builtin.set_fact:
+        j2d_raw: "{{ lookup('ansible.builtin.file', lookup('ansible.builtin.env', 'J2D_INPUT'), rstrip=false) }}"
+
+    - name: Check UTF-8
+      ansible.builtin.assert:
+        that: j2d_raw is not search('[\ud800-\udfff]')
+        fail_msg: "input is not valid UTF-8"
+        quiet: true
+
+    # from_json is Python's json: it also accepts NaN/Infinity (always rejected below, being numbers)
+    # and duplicate names (the last one wins, which §4.2 allows).
+    - name: Parse the document
+      ansible.builtin.set_fact:
+        j2d_doc: "{{ j2d_raw | ansible.builtin.from_json }}"
+
+    - name: Check the root
+      ansible.builtin.assert:
+        that: j2d_doc is mapping
+        fail_msg: "the root of the document must be an object"
+        quiet: true
+
+    # §4, §6: validate the whole tree and flatten it, breadth first (parents before children).
+    - name: Validate and plan
+      ansible.builtin.set_fact:
+        j2d_plan: >-
+          {%- set bad = '[\ud800-\udfff]' -%}
+          {%- set ns = namespace(entries=[], errors=[], frontier=[{'path': '', 'value': j2d_doc}]) -%}
+          {%- for depth in range(j2d_max_depth + 1) -%}
+            {%- set nx = namespace(frontier=[]) -%}
+            {%- if depth == j2d_max_depth and ns.frontier -%}
+              {%- set ns.errors = ns.errors + ['the document is nested too deeply'] -%}
+            {%- endif -%}
+            {%- for f in (ns.frontier if depth < j2d_max_depth else []) -%}
+              {%- for name in f.value.keys() | sort(case_sensitive=true) -%}
+                {%- set v = f.value[name] -%}
+                {%- set p = (f.path ~ '/' ~ name) if f.path else name -%}
+                {%- if name is search(bad) -%}
+                  {%- set ns.errors = ns.errors + [p ~ ': name contains an unpaired surrogate'] -%}
+                {%- elif name in ['', '.', '..'] or '/' in name or '\x00' in name -%}
+                  {%- set ns.errors = ns.errors + [p ~ ': invalid name ' ~ (name | to_json)] -%}
+                {%- elif v is string -%}
+                  {%- if v is search(bad) -%}
+                    {%- set ns.errors = ns.errors + [p ~ ': string contains an unpaired surrogate'] -%}
+                  {%- endif -%}
+                  {%- set ns.entries = ns.entries + [{'path': p, 'parent': f.path, 'kind': 'file', 'value': v}] -%}
+                {%- elif v is mapping -%}
+                  {%- set ns.entries = ns.entries + [{'path': p, 'parent': f.path, 'kind': 'dir', 'value': ''}] -%}
+                  {%- set nx.frontier = nx.frontier + [{'path': p, 'value': v}] -%}
+                {%- elif v is sequence and v is not string -%}
+                  {%- if v | length != 2 or v[0] is not string or v[1] is not string or v[0] not in ['link', 'script'] -%}
+                    {%- set ns.errors = ns.errors + [p ~ ': an array must be ["link", target] or ["script", content]'] -%}
+                  {%- elif v[1] is search(bad) -%}
+                    {%- set ns.errors = ns.errors + [p ~ ': string contains an unpaired surrogate'] -%}
+                  {%- elif v[0] == 'link' and '\x00' in v[1] -%}
+                    {%- set ns.errors = ns.errors + [p ~ ': a link target cannot contain NUL'] -%}
+                  {%- else -%}
+                    {%- set ns.entries = ns.entries + [{'path': p, 'parent': f.path, 'kind': v[0], 'value': v[1]}] -%}
+                  {%- endif -%}
+                {%- else -%}
+                  {%- set ns.errors = ns.errors + [p ~ ': numbers, booleans and null are not allowed'] -%}
+                {%- endif -%}
+              {%- endfor -%}
+            {%- endfor -%}
+            {%- set ns.frontier = nx.frontier -%}
+          {%- endfor -%}
+          {{ {'entries': ns.entries, 'errors': ns.errors} }}
+
+    - name: Check the document
+      ansible.builtin.assert:
+        that: j2d_plan.errors | length == 0
+        fail_msg: "{{ j2d_plan.errors | join('; ') }}"
+        quiet: true
+
+    # §5: look at what exists, one level at a time (stat-level.yml recurses). stat does not follow
+    # the entry itself but does follow its parents, so only children of real directories we keep
+    # are looked at; everything else counts as not existing.
+    - name: Look at existing entries
+      ansible.builtin.include_tasks: stat-level.yml
+      vars:
+        j2d_level: "{{ j2d_plan.entries | selectattr('parent', 'eq', '') | list }}"
+      when: j2d_plan.entries | length > 0
+
+    # §5.4: a directory in the way of a non-object is an error; it is never removed.
+    - name: Check for directories in the way
+      ansible.builtin.assert:
+        that: j2d_in_way | length == 0
+        fail_msg: "{{ j2d_in_way | map('regex_replace', '$', ': a directory is in the way') | join('; ') }}"
+        quiet: true
+      vars:
+        j2d_in_way: >-
+          {{ j2d_plan.entries | rejectattr('kind', 'eq', 'dir') | map(attribute='path')
+             | select('in', j2d_existing | dict2items | selectattr('value', 'eq', 'dir') | map(attribute='key') | list)
+             | list }}
+
+    # §5.2, §5.3: other existing entries (files, symlinks) are removed, never followed.
+    - name: Remove replaced entries
+      ansible.builtin.file:
+        path: "{{ j2d_target }}/{{ item.path }}"
+        state: absent
+      loop: "{{ j2d_plan.entries | selectattr('path', 'in', j2d_other) | list or [none] }}"
+      loop_control:
+        label: "{{ item.path | default('-') }}"
+      when: item is not none
+      vars:
+        j2d_other: "{{ j2d_existing | dict2items | selectattr('value', 'eq', 'other') | map(attribute='key') | list }}"
+
+    # file state=directory creates missing parents too, so only the deepest new directories are named.
+    - name: Create directories
+      ansible.builtin.file:
+        path: "{{ j2d_target }}/{{ item }}"
+        state: directory
+      loop: "{{ j2d_new_dirs | reject('in', j2d_plan.entries | selectattr('path', 'in', j2d_new_dirs) | map(attribute='parent') | list) | list or [none] }}"
+      loop_control:
+        label: "{{ item | default('-') }}"
+      when: item is not none
+      vars:
+        j2d_new_dirs: "{{ j2d_plan.entries | selectattr('kind', 'eq', 'dir') | map(attribute='path') | reject('in', j2d_existing | dict2items | selectattr('value', 'eq', 'dir') | map(attribute='key') | list) | list }}"
+
+    # §4.3: no mode given, so a new file gets 0666 & ~umask.
+    - name: Write files
+      ansible.builtin.copy:
+        dest: "{{ j2d_target }}/{{ item.path }}"
+        content: "{{ item.value }}"
+      loop: "{{ j2d_plan.entries | selectattr('kind', 'in', ['file', 'script']) | list or [none] }}"
+      loop_control:
+        label: "{{ item.path | default('-') }}"
+      when: item is not none
+
+    # §4.4.2: scripts get a+x on top.
+    - name: Make scripts executable
+      ansible.builtin.file:
+        path: "{{ j2d_target }}/{{ item.path }}"
+        mode: a+x
+      loop: "{{ j2d_plan.entries | selectattr('kind', 'eq', 'script') | list or [none] }}"
+      loop_control:
+        label: "{{ item.path | default('-') }}"
+      when: item is not none
+
+    - name: Create symbolic links
+      ansible.builtin.file:
+        path: "{{ j2d_target }}/{{ item.path }}"
+        src: "{{ item.value }}"
+        state: link
+        follow: false
+        force: true
+      loop: "{{ j2d_plan.entries | selectattr('kind', 'eq', 'link') | list or [none] }}"
+      loop_control:
+        label: "{{ item.path | default('-') }}"
+      when: item is not none

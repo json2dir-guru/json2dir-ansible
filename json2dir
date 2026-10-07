@@ -1,0 +1,24 @@
+#!/bin/sh
+# json2dir: transport only. Saves stdin to a temporary file and runs json2dir.yml with ansible-playbook
+# (found on PATH, or in $ANSIBLE_PLAYBOOK); the logic lives in the playbook.
+if [ $# -ne 0 ]; then
+  echo "usage: json2dir < document.json" >&2
+  exit 2
+fi
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 1
+tmp=$(mktemp -d) || exit 1
+trap 'rm -rf "$tmp"' EXIT
+cat >"$tmp/input.json" || exit 1
+: >"$tmp/ansible.cfg"
+J2D_INPUT="$tmp/input.json" J2D_TARGET="$PWD" \
+LC_ALL=C.UTF-8 \
+ANSIBLE_CONFIG="$tmp/ansible.cfg" ANSIBLE_HOME="$tmp/home" \
+ANSIBLE_LOCAL_TEMP="$tmp/local" ANSIBLE_REMOTE_TEMP="$tmp/remote" \
+ANSIBLE_PIPELINING=1 ANSIBLE_STDOUT_CALLBACK=minimal ANSIBLE_NOCOLOR=1 ANSIBLE_RETRY_FILES_ENABLED=0 \
+ANSIBLE_LOCALHOST_WARNING=0 ANSIBLE_INVENTORY_UNPARSED_WARNING=0 ANSIBLE_DEPRECATION_WARNINGS=0 \
+"${ANSIBLE_PLAYBOOK:-ansible-playbook}" -i localhost, -c local "$here/json2dir.yml" >"$tmp/log" 2>&1
+status=$?
+if [ $status -ne 0 ]; then
+  grep -E '(ERROR|"msg")' "$tmp/log" | grep -v 'All assertions passed' >&2 || cat "$tmp/log" >&2
+  exit 1
+fi

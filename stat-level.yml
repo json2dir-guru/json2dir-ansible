@@ -1,0 +1,32 @@
+# One level of the tree: stat its entries (j2d_level), record what exists in j2d_existing,
+# then go on with the entries inside the existing real directories.
+- name: Stat one level
+  ansible.builtin.stat:
+    path: "{{ j2d_target }}/{{ item.path }}"
+    follow: false
+    get_checksum: false
+    get_mime: false
+    get_attributes: false
+  loop: "{{ j2d_level }}"
+  loop_control:
+    label: "{{ item.path }}"
+  register: j2d_stat
+
+- name: Record existing entries
+  ansible.builtin.set_fact:
+    j2d_existing: >-
+      {%- set ns = namespace(st=j2d_existing) -%}
+      {%- for r in j2d_stat.results if r.stat.exists -%}
+        {%- set ns.st = ns.st | combine({r.item.path: 'dir' if r.stat.isdir else 'other'}) -%}
+      {%- endfor -%}
+      {{ ns.st }}
+    j2d_next: >-
+      {{ j2d_plan.entries | selectattr('parent', 'in', j2d_stat.results | selectattr('stat.exists')
+         | selectattr('stat.isdir') | map(attribute='item.path') | list) | list }}
+
+# j2d_level of the nested include is read lazily, while its stat runs, before j2d_next changes again.
+- name: Next level
+  ansible.builtin.include_tasks: stat-level.yml
+  vars:
+    j2d_level: "{{ j2d_next }}"
+  when: j2d_next | length > 0
