@@ -37,7 +37,19 @@
       ansible.builtin.set_fact:
         j2d_plan: >-
           {%- set bad = '[\ud800-\udfff]' -%}
+          {#- §10: ansible path arguments go through os.path.expandvars, and expanduser for a leading ~. -#}
+          {#- The wrapper runs ansible with env -i, so a $NAME or ${NAME} (Python's exact pattern) is only -#}
+          {#- rewritten when NAME is set here or is PWD (added by /bin/sh); expands() flags those. -#}
+          {%- macro expands(s) -%}
+            {%- for m in s | regex_findall('[$]([A-Za-z0-9_]+|[{][^}]*[}]?)') -%}
+              {%- set n = m[1:-1] if (m[:1] == '{' and m[-1:] == '}' and m | length > 1) else (none if m[:1] == '{' else m) -%}
+              {%- if n is not none and (n == 'PWD' or lookup('ansible.builtin.env', n, default='\x00') != '\x00') -%}x{%- endif -%}
+            {%- endfor -%}
+          {%- endmacro -%}
           {%- set ns = namespace(entries=[], errors=[], frontier=[{'path': '', 'value': j2d_doc}]) -%}
+          {%- if j2d_target is not match('/') or expands(j2d_target) -%}
+            {%- set ns.errors = ns.errors + ['the current directory path contains $NAME or ${NAME}, which ansible would expand'] -%}
+          {%- endif -%}
           {%- for depth in range(j2d_max_depth + 1) -%}
             {%- set nx = namespace(frontier=[]) -%}
             {%- if depth == j2d_max_depth and ns.frontier -%}
@@ -51,6 +63,8 @@
                   {%- set ns.errors = ns.errors + [p ~ ': name contains an unpaired surrogate'] -%}
                 {%- elif name in ['', '.', '..'] or '/' in name or '\x00' in name -%}
                   {%- set ns.errors = ns.errors + [p ~ ': invalid name ' ~ (name | to_json)] -%}
+                {%- elif expands(name) -%}
+                  {%- set ns.errors = ns.errors + [p ~ ': a name with $NAME or ${NAME} of a set variable cannot be created exactly by ansible'] -%}
                 {%- elif v is string -%}
                   {%- if v is search(bad) -%}
                     {%- set ns.errors = ns.errors + [p ~ ': string contains an unpaired surrogate'] -%}
@@ -66,6 +80,8 @@
                     {%- set ns.errors = ns.errors + [p ~ ': string contains an unpaired surrogate'] -%}
                   {%- elif v[0] == 'link' and '\x00' in v[1] -%}
                     {%- set ns.errors = ns.errors + [p ~ ': a link target cannot contain NUL'] -%}
+                  {%- elif v[0] == 'link' and (v[1] is match('~') or expands(v[1])) -%}
+                    {%- set ns.errors = ns.errors + [p ~ ': a link target with a leading ~ or $NAME / ${NAME} of a set variable cannot be created exactly by ansible'] -%}
                   {%- else -%}
                     {%- set ns.entries = ns.entries + [{'path': p, 'parent': f.path, 'kind': v[0], 'value': v[1]}] -%}
                   {%- endif -%}
